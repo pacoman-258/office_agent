@@ -4,6 +4,8 @@ import { downloadBlob, generateSpec, previewTemplate, renderPresentation } from 
 import { locales, statusLabels, workflowLabels } from "./i18n";
 import type {
   CustomThemeConfig,
+  FinalizeConfig,
+  FinalizeSummary,
   GenerateSpecRequest,
   Language,
   PresentationSpec,
@@ -20,17 +22,23 @@ import type {
 
 type StageState = Record<WorkflowStageKey, WorkflowStageStatus>;
 type TemplateMappingDraft = Partial<Record<TemplatePart, number>>;
+type TemplateMode = "manual" | "preview";
 
 interface FormState {
   provider: Provider;
   apiKey: string;
   model: string;
+  finalizeEnabled: boolean;
+  finalizeModel: string;
+  finalizeMaxRounds: number;
   theme: ThemeSpec;
   openaiBaseUrl: string;
   ollamaBaseUrl: string;
   prompt: string;
   filename: string;
 }
+
+type SpecAffectingField = "provider" | "apiKey" | "model" | "theme" | "openaiBaseUrl" | "ollamaBaseUrl" | "prompt";
 
 const defaultModels: Record<Provider, string> = {
   openai: "gpt-4o-mini",
@@ -85,6 +93,9 @@ const initialFormState = (): FormState => ({
   provider: "openai",
   apiKey: "",
   model: defaultModels.openai,
+  finalizeEnabled: false,
+  finalizeModel: "gpt-4.1-mini",
+  finalizeMaxRounds: 2,
   theme: initialTheme(),
   openaiBaseUrl: "https://api.openai.com/v1",
   ollamaBaseUrl: "http://localhost:11434",
@@ -156,6 +167,20 @@ function buildGenerateSpecRequest(form: FormState, mapping: TemplateSelectionSpe
   };
 }
 
+function buildFinalizeRequest(form: FormState): FinalizeConfig | null {
+  if (!form.finalizeEnabled) {
+    return null;
+  }
+  return {
+    enabled: true,
+    provider: "openai",
+    model: form.finalizeModel.trim() || undefined,
+    apiKey: form.provider === "openai" ? form.apiKey : undefined,
+    baseUrl: form.openaiBaseUrl,
+    maxRounds: form.finalizeMaxRounds,
+  };
+}
+
 function summarizeSlide(slide: SlideSpec, labels: { keyPointsLabel: string; nextStepsLabel: string }): string[] {
   switch (slide.type) {
     case "title":
@@ -180,6 +205,29 @@ function summarizeSlide(slide: SlideSpec, labels: { keyPointsLabel: string; next
   }
 }
 
+function officeStatusFromSummary(enabled: boolean, summary?: FinalizeSummary | null): WorkflowStageStatus {
+  if (!enabled) {
+    return "skipped";
+  }
+  if (!summary) {
+    return "error";
+  }
+  if (summary.status === "completed" || summary.status === "partial") {
+    return "success";
+  }
+  if (summary.status === "skipped") {
+    return "skipped";
+  }
+  return "error";
+}
+
+function formatOfficeNote(copy: Record<string, string>, summary: FinalizeSummary | null): string | null {
+  if (!summary) {
+    return null;
+  }
+  return `${copy.finalizeStatus}: ${summary.status} | ${copy.finalizeRounds}: ${summary.rounds.length} | ${copy.finalizeIssues}: ${summary.issuesFound} | ${copy.finalizeOperations}: ${summary.operationsApplied}`;
+}
+
 export default function App() {
   const [language, setLanguage] = useState<Language>(getInitialLanguage);
   const [form, setForm] = useState<FormState>(initialFormState);
@@ -187,9 +235,12 @@ export default function App() {
   const [spec, setSpec] = useState<PresentationSpec | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [finalizeSummary, setFinalizeSummary] = useState<FinalizeSummary | null>(null);
   const [themeJsonDraft, setThemeJsonDraft] = useState(JSON.stringify(initialTheme(), null, 2));
   const [templateFile, setTemplateFile] = useState<File | null>(null);
+  const [templateMode, setTemplateMode] = useState<TemplateMode>("manual");
   const [templateSlides, setTemplateSlides] = useState<TemplatePreviewSlide[]>([]);
+  const [templateCleanupMode, setTemplateCleanupMode] = useState<"preserve_branding" | null>(null);
   const [templateMappingDraft, setTemplateMappingDraft] = useState<TemplateMappingDraft>({});
   const [templatePreviewError, setTemplatePreviewError] = useState<string | null>(null);
   const [isTemplatePreviewLoading, setIsTemplatePreviewLoading] = useState(false);
@@ -213,6 +264,7 @@ export default function App() {
   function clearGeneratedOutput(promptText: string = form.prompt): void {
     setError(null);
     setWarnings([]);
+    setFinalizeSummary(null);
     if (!spec) {
       return;
     }
@@ -231,6 +283,11 @@ export default function App() {
     clearGeneratedOutput(nextForm.prompt);
   }
 
+  function updateNonSpecForm(nextForm: FormState): void {
+    setForm(nextForm);
+    syncThemeDraft(nextForm.theme);
+  }
+
   function updateField<Key extends keyof FormState>(key: Key, value: FormState[Key]): void {
     if (key === "provider") {
       const nextProvider = value as Provider;
@@ -238,7 +295,16 @@ export default function App() {
       updateForm({ ...form, provider: nextProvider, model: nextModel });
       return;
     }
-    updateForm({ ...form, [key]: value });
+    const nextForm = { ...form, [key]: value };
+    if (
+      (["apiKey", "model", "theme", "openaiBaseUrl", "ollamaBaseUrl", "prompt"] as SpecAffectingField[]).includes(
+        key as SpecAffectingField,
+      )
+    ) {
+      updateForm(nextForm);
+      return;
+    }
+    updateNonSpecForm(nextForm);
   }
 
   function updateThemePreset(value: ThemePreset): void {
@@ -272,10 +338,22 @@ export default function App() {
     clearGeneratedOutput();
   }
 
+  function updateTemplatePageNumber(part: TemplatePart, value: string): void {
+    const trimmed = value.trim();
+    const pageNumber = Number(trimmed);
+    setTemplateMappingDraft((current) => ({
+      ...current,
+      [part]: trimmed === "" || Number.isNaN(pageNumber) ? undefined : Math.max(Math.floor(pageNumber) - 1, 0),
+    }));
+    clearGeneratedOutput();
+  }
+
   async function handleTemplateChange(event: ChangeEvent<HTMLInputElement>): Promise<void> {
     const nextFile = event.target.files?.[0] ?? null;
     setTemplateFile(nextFile);
+    setTemplateMode("manual");
     setTemplateSlides([]);
+    setTemplateCleanupMode(null);
     setTemplateMappingDraft({});
     setTemplatePreviewError(null);
     clearGeneratedOutput();
@@ -283,25 +361,34 @@ export default function App() {
     if (!nextFile) {
       return;
     }
+  }
 
+  function clearTemplate(): void {
+    setTemplateFile(null);
+    setTemplateMode("manual");
+    setTemplateSlides([]);
+    setTemplateCleanupMode(null);
+    setTemplateMappingDraft({});
+    setTemplatePreviewError(null);
+    clearGeneratedOutput();
+  }
+
+  async function handleLoadTemplatePreview(): Promise<void> {
+    if (!templateFile) {
+      return;
+    }
+    setTemplatePreviewError(null);
     setIsTemplatePreviewLoading(true);
     try {
-      const preview = await previewTemplate(nextFile);
+      const preview = await previewTemplate(templateFile);
       setTemplateSlides(preview.slides);
+      setTemplateCleanupMode(preview.cleanupMode ?? null);
     } catch (caught) {
       const message = normalizeStageError(caught instanceof Error ? caught.message : "Unknown error");
       setTemplatePreviewError(message);
     } finally {
       setIsTemplatePreviewLoading(false);
     }
-  }
-
-  function clearTemplate(): void {
-    setTemplateFile(null);
-    setTemplateSlides([]);
-    setTemplateMappingDraft({});
-    setTemplatePreviewError(null);
-    clearGeneratedOutput();
   }
 
   async function handleGenerateSpec(): Promise<void> {
@@ -348,20 +435,22 @@ export default function App() {
     }
     setError(null);
     setWarnings([]);
+    setFinalizeSummary(null);
     setIsGeneratingPpt(true);
     setStages((current) => ({
       ...current,
       render: "running",
-      office: "idle",
+      office: form.finalizeEnabled ? "running" : "idle",
     }));
     try {
-      const result = await renderPresentation({ filename: form.filename, spec }, templateFile);
+      const result = await renderPresentation({ filename: form.filename, spec, finalize: buildFinalizeRequest(form) }, templateFile);
       downloadBlob(result.blob, form.filename);
       setWarnings(result.warnings);
+      setFinalizeSummary(result.finalizeSummary ?? null);
       setStages((current) => ({
         ...current,
         render: "success",
-        office: "skipped",
+        office: officeStatusFromSummary(form.finalizeEnabled, result.finalizeSummary),
       }));
     } catch (caught) {
       const message = normalizeStageError(caught instanceof Error ? caught.message : "Unknown error");
@@ -401,8 +490,7 @@ export default function App() {
     Boolean(form.prompt.trim()) &&
     !isGeneratingSpec &&
     !isGeneratingPpt &&
-    !isTemplatePreviewLoading &&
-    (!templateFile || (Boolean(templateSlides.length) && !templatePreviewError && Boolean(templateMapping)));
+    (!templateFile || Boolean(templateMapping));
 
   return (
     <main className="app-shell">
@@ -470,6 +558,36 @@ export default function App() {
                   <input aria-label={copy.ollamaBaseUrl} value={form.ollamaBaseUrl} onChange={(event) => updateField("ollamaBaseUrl", event.target.value)} />
                 </Field>
               )}
+            </div>
+
+            <div className="subpanel">
+              <div className="subpanel-header">
+                <strong>{copy.finalizeTitle}</strong>
+              </div>
+              <Field label={copy.finalizeEnabled} fullWidth>
+                <select
+                  aria-label={copy.finalizeEnabled}
+                  value={form.finalizeEnabled ? "true" : "false"}
+                  onChange={(event) => updateField("finalizeEnabled", event.target.value === "true")}
+                >
+                  <option value="false">false</option>
+                  <option value="true">true</option>
+                </select>
+              </Field>
+              <Field label={copy.finalizeModel}>
+                <input aria-label={copy.finalizeModel} value={form.finalizeModel} onChange={(event) => updateField("finalizeModel", event.target.value)} />
+              </Field>
+              <Field label={copy.finalizeMaxRounds}>
+                <input
+                  aria-label={copy.finalizeMaxRounds}
+                  type="number"
+                  min={1}
+                  max={5}
+                  value={form.finalizeMaxRounds}
+                  onChange={(event) => updateField("finalizeMaxRounds", Math.max(1, Math.min(5, Number(event.target.value) || 1)))}
+                />
+              </Field>
+              <p className="helper-text">{copy.finalizeHint}</p>
             </div>
           </div>
 
@@ -554,45 +672,106 @@ export default function App() {
               ) : null}
             </div>
 
-            <div className="subpanel">
-              <div className="subpanel-header">
-                <strong>{copy.templatePreview}</strong>
+            {templateFile ? (
+              <div className="subpanel">
+                <div className="subpanel-header">
+                  <strong>{copy.templateMode}</strong>
+                </div>
+                <div className="action-row">
+                  <button
+                    className={templateMode === "manual" ? "secondary-button active-mode" : "ghost-button"}
+                    onClick={() => setTemplateMode("manual")}
+                  >
+                    {copy.templateModeManual}
+                  </button>
+                  <button
+                    className={templateMode === "preview" ? "secondary-button active-mode" : "ghost-button"}
+                    onClick={() => setTemplateMode("preview")}
+                  >
+                    {copy.templateModePreview}
+                  </button>
+                </div>
               </div>
-              {isTemplatePreviewLoading ? <p className="helper-text">{copy.templatePreviewLoading}</p> : null}
-              {templatePreviewError ? <p className="error-banner compact-error">{`${copy.templatePreviewError}: ${templatePreviewError}`}</p> : null}
-              {!templateFile && !isTemplatePreviewLoading ? <p className="helper-text">{copy.templatePreviewEmpty}</p> : null}
-              {templateSlides.length > 0 ? (
-                <div className="template-grid">
-                  {templateSlides.map((slide) => (
-                    <article key={slide.index} className="template-card">
-                      <img src={slide.thumbnailDataUrl} alt={formatTemplateSlideLabel(copy.slideIndex, slide.index, slide.titleText)} />
-                      <div className="template-card-body">
-                        <strong>{formatTemplateSlideLabel(copy.slideIndex, slide.index, slide.titleText)}</strong>
-                        <p>{slide.titleText ?? "-"}</p>
-                        <div className="role-badge-row">
-                          {slide.placeholderRoles.map((role) => (
-                            <span key={`${role}-${slide.index}`} className="role-badge">
-                              {role}
-                            </span>
-                          ))}
-                        </div>
-                        <div className="role-badge-row selected-badges">
-                          {templatePartOrder
-                            .filter((part) => templateMappingDraft[part] === slide.index)
-                            .map((part) => (
-                              <span key={`${part}-${slide.index}`} className="selection-badge">
-                                {partLabel(copy, part)}
-                              </span>
-                            ))}
-                        </div>
-                      </div>
-                    </article>
+            ) : null}
+
+            {templateFile ? (
+              <div className="subpanel">
+                <div className="subpanel-header">
+                  <strong>{copy.templateManualMapping}</strong>
+                </div>
+                <p className="helper-text">{copy.templateManualHint}</p>
+                <div className="mapping-grid">
+                  {templatePartOrder.map((part) => (
+                    <Field key={part} label={partLabel(copy, part)} fullWidth>
+                      <input
+                        aria-label={partLabel(copy, part)}
+                        type="number"
+                        min={1}
+                        step={1}
+                        inputMode="numeric"
+                        placeholder={copy.templatePageNumber}
+                        value={typeof templateMappingDraft[part] === "number" ? String((templateMappingDraft[part] as number) + 1) : ""}
+                        onChange={(event) => updateTemplatePageNumber(part, event.target.value)}
+                      />
+                    </Field>
                   ))}
                 </div>
-              ) : null}
-            </div>
+                <p className="helper-text">{copy.templatePageNumberHint}</p>
+                {templateSelectionRequired ? <p className="helper-text">{copy.templateSelectionRequired}</p> : null}
+              </div>
+            ) : null}
 
-            {templateSlides.length > 0 ? (
+            {templateMode === "preview" ? (
+              <div className="subpanel">
+                <div className="subpanel-header">
+                  <strong>{copy.templatePreview}</strong>
+                  <button
+                    className="secondary-button"
+                    onClick={() => void handleLoadTemplatePreview()}
+                    disabled={!templateFile || isTemplatePreviewLoading}
+                  >
+                    {copy.templatePreviewAction}
+                  </button>
+                </div>
+                {isTemplatePreviewLoading ? <p className="helper-text">{copy.templatePreviewLoading}</p> : null}
+                {templatePreviewError ? <p className="error-banner compact-error">{`${copy.templatePreviewError}: ${templatePreviewError}`}</p> : null}
+                {!templateSlides.length && !isTemplatePreviewLoading ? <p className="helper-text">{copy.templatePreviewEmpty}</p> : null}
+                {templateSlides.length > 0 && templateCleanupMode === "preserve_branding" ? (
+                  <p className="helper-text">{copy.templateCleanupNotice}</p>
+                ) : null}
+                {templateSlides.length > 0 ? (
+                  <div className="template-grid">
+                    {templateSlides.map((slide) => (
+                      <article key={slide.index} className="template-card">
+                        <img src={slide.thumbnailDataUrl} alt={formatTemplateSlideLabel(copy.slideIndex, slide.index, slide.titleText)} />
+                        <div className="template-card-body">
+                          <strong>{formatTemplateSlideLabel(copy.slideIndex, slide.index, slide.titleText)}</strong>
+                          <p>{slide.titleText ?? "-"}</p>
+                          <div className="role-badge-row">
+                            {slide.placeholderRoles.map((role) => (
+                              <span key={`${role}-${slide.index}`} className="role-badge">
+                                {role}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="role-badge-row selected-badges">
+                            {templatePartOrder
+                              .filter((part) => templateMappingDraft[part] === slide.index)
+                              .map((part) => (
+                                <span key={`${part}-${slide.index}`} className="selection-badge">
+                                  {partLabel(copy, part)}
+                                </span>
+                              ))}
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {templateMode === "preview" && templateSlides.length > 0 ? (
               <div className="subpanel">
                 <div className="subpanel-header">
                   <strong>{copy.templateMappings}</strong>
@@ -611,7 +790,6 @@ export default function App() {
                     </Field>
                   ))}
                 </div>
-                {templateSelectionRequired ? <p className="helper-text">{copy.templateSelectionRequired}</p> : null}
               </div>
             ) : null}
 
@@ -651,7 +829,13 @@ export default function App() {
                     </div>
                     <StatusPill label={statusLabels[language][stages[key]]} status={stages[key]} />
                   </div>
-                  {key === "office" ? <p className="workflow-note">{copy.officePlaceholder}</p> : null}
+                  {key === "office" ? (
+                    <p className="workflow-note">
+                      {stages.office === "running"
+                        ? copy.officeRunning
+                        : formatOfficeNote(copy, finalizeSummary) ?? copy.officePlaceholder}
+                    </p>
+                  ) : null}
                 </article>
               ))}
             </div>
@@ -691,6 +875,15 @@ export default function App() {
                 {warnings.map((warning) => (
                   <p key={warning}>{warning}</p>
                 ))}
+              </div>
+            ) : null}
+            {finalizeSummary ? (
+              <div className="theme-summary">
+                <strong>{copy.finalizeSummary}</strong>
+                <p>{`${copy.finalizeStatus}: ${finalizeSummary.status}`}</p>
+                <p>{`${copy.finalizeRounds}: ${finalizeSummary.rounds.length}`}</p>
+                <p>{`${copy.finalizeIssues}: ${finalizeSummary.issuesFound}`}</p>
+                <p>{`${copy.finalizeOperations}: ${finalizeSummary.operationsApplied}`}</p>
               </div>
             ) : null}
           </div>

@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from office_agent.config import AppConfig
+from office_agent.office.finalizer import finalize_config_from_env
+from office_agent.office.models import FinalizeConfig
 from office_agent.schema import PresentationSpec, TemplateSelectionSpec, ThemeSpec
 
 
@@ -38,11 +40,34 @@ class GenerateSpecRequest(RuntimeProviderConfig):
     template_mapping: TemplateSelectionSpec | None = Field(default=None, alias="templateMapping")
 
 
+class FinalizeRequestConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    provider: Literal["openai"] = "openai"
+    model: str | None = None
+    api_key: str | None = Field(default=None, alias="apiKey")
+    base_url: str | None = Field(default=None, alias="baseUrl")
+    max_rounds: int = Field(default=2, alias="maxRounds", ge=1, le=5)
+
+    def to_finalize_config(self) -> FinalizeConfig:
+        env_config = finalize_config_from_env()
+        return FinalizeConfig(
+            enabled=self.enabled,
+            provider=self.provider,
+            model=self.model or env_config.model,
+            api_key=self.api_key or env_config.api_key,
+            base_url=(self.base_url or env_config.base_url).rstrip("/"),
+            max_rounds=self.max_rounds,
+        )
+
+
 class RenderPresentationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     spec: PresentationSpec
     filename: str = Field(min_length=1)
+    finalize: FinalizeRequestConfig | None = None
 
 
 class TemplatePreviewSlide(BaseModel):
@@ -58,6 +83,7 @@ class TemplatePreviewResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     slides: list[TemplatePreviewSlide]
+    cleanup_mode: Literal["preserve_branding"] = Field(default="preserve_branding", alias="cleanupMode")
 
 
 class HealthResponse(BaseModel):

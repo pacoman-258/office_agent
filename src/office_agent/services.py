@@ -9,6 +9,7 @@ from office_agent.config import AppConfig
 from office_agent.errors import RenderError
 from office_agent.llm import generate_presentation_spec
 from office_agent.office import finalize_presentation
+from office_agent.office.models import FinalizeConfig, FinalizeSummary
 from office_agent.renderer import PresentationRenderer, RenderResult
 from office_agent.schema import PresentationSpec, TemplateSelectionSpec
 from office_agent.template_preview import build_template_preview
@@ -19,6 +20,7 @@ class PresentationArtifact:
     filename: str
     content: bytes
     warnings: list[str]
+    finalize_summary: FinalizeSummary | None = None
 
 
 INVALID_WINDOWS_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -36,11 +38,14 @@ def render_presentation(
     spec: PresentationSpec,
     out_path: str | Path,
     template_path: str | Path | None = None,
+    finalize_config: FinalizeConfig | None = None,
 ) -> RenderResult:
     renderer = PresentationRenderer()
     result = renderer.render(spec, out_path, template_path=template_path)
-    finalized_path = finalize_presentation(result.path)
-    return RenderResult(path=finalized_path, warnings=result.warnings)
+    finalize_result = finalize_presentation(result.path, spec=spec, config=finalize_config)
+    warnings = list(result.warnings)
+    warnings.extend(finalize_result.summary.warnings)
+    return RenderResult(path=Path(finalize_result.path), warnings=warnings, finalize_summary=finalize_result.summary)
 
 
 def render_presentation_artifact(
@@ -48,6 +53,7 @@ def render_presentation_artifact(
     filename: str,
     template_bytes: bytes | None = None,
     template_filename: str | None = None,
+    finalize_config: FinalizeConfig | None = None,
 ) -> PresentationArtifact:
     download_name = normalize_download_filename(filename)
     temp_name = "presentation.pptx"
@@ -60,9 +66,14 @@ def render_presentation_artifact(
                 raise RenderError("Template file must use the .pptx format.")
             template_path = Path(temp_dir) / "uploaded-template.pptx"
             template_path.write_bytes(template_bytes)
-        result = render_presentation(spec, out_path, template_path=template_path)
+        result = render_presentation(spec, out_path, template_path=template_path, finalize_config=finalize_config)
         content = result.path.read_bytes()
-    return PresentationArtifact(filename=download_name, content=content, warnings=result.warnings)
+    return PresentationArtifact(
+        filename=download_name,
+        content=content,
+        warnings=result.warnings,
+        finalize_summary=result.finalize_summary,
+    )
 
 
 def normalize_download_filename(filename: str) -> str:

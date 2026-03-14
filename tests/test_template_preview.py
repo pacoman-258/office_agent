@@ -42,6 +42,26 @@ class TemplatePreviewTests(TestCase):
         self.assertEqual(preview.slides[0].title_text, "Cover")
         self.assertEqual(preview.slides[0].placeholder_roles, ["subtitle", "title"])
         self.assertTrue(preview.slides[0].thumbnail_data_url.startswith("data:image/png;base64,"))
+        self.assertEqual(preview.cleanup_mode, "preserve_branding")
+
+    def test_build_template_preview_detects_native_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "native-template.pptx"
+            presentation = Presentation()
+            slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+            slide.shapes.title.text = "Agenda"
+            slide.placeholders[1].text = "Body placeholder"
+            presentation.save(str(template_path))
+
+            def fake_export(_: Path, output_dir: Path) -> dict[int, Path]:
+                image_path = output_dir / "slide-0.png"
+                image_path.write_bytes(PNG_BYTES)
+                return {0: image_path}
+
+            with patch("office_agent.template_preview.export_template_thumbnails", side_effect=fake_export):
+                preview = build_template_preview(template_path.read_bytes(), template_path.name)
+
+        self.assertEqual(preview.slides[0].placeholder_roles, ["body", "title"])
 
     def test_build_template_preview_rejects_non_pptx(self) -> None:
         with self.assertRaises(TemplatePreviewError):

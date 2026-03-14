@@ -8,7 +8,7 @@ from pptx import Presentation
 
 from office_agent.api.models import TemplatePreviewResponse, TemplatePreviewSlide
 from office_agent.errors import OfficeAgentError
-from office_agent.template_support import extract_placeholder_roles, extract_slide_title_text
+from office_agent.template_support import TEMPLATE_CLEANUP_MODE, analyze_template_slide, extract_slide_title_text
 
 
 THUMBNAIL_WIDTH = 1280
@@ -36,15 +36,16 @@ def build_template_preview(template_bytes: bytes, filename: str) -> TemplatePrev
             thumbnail_path = thumbnails.get(index)
             if thumbnail_path is None or not thumbnail_path.exists():
                 raise TemplatePreviewError("Failed to generate thumbnails for all template slides.")
+            analysis = analyze_template_slide(slide)
             slides.append(
                 TemplatePreviewSlide(
                     index=index,
                     thumbnailDataUrl=png_to_data_url(thumbnail_path),
                     titleText=extract_slide_title_text(slide),
-                    placeholderRoles=extract_placeholder_roles(slide),
+                    placeholderRoles=analysis.placeholder_roles,
                 )
             )
-        return TemplatePreviewResponse(slides=slides)
+        return TemplatePreviewResponse(slides=slides, cleanupMode=TEMPLATE_CLEANUP_MODE)
 
 
 def export_template_thumbnails(template_path: Path, output_dir: Path) -> dict[int, Path]:

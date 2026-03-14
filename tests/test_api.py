@@ -76,7 +76,8 @@ class ApiTests(TestCase):
         preview = TemplatePreviewResponse(
             slides=[
                 TemplatePreviewSlide(index=0, thumbnailDataUrl="data:image/png;base64,aaa", titleText="Cover", placeholderRoles=["title", "subtitle"])
-            ]
+            ],
+            cleanupMode="preserve_branding",
         )
         with patch("office_agent.api.app.preview_template_artifact", return_value=preview):
             response = self.client.post(
@@ -86,15 +87,22 @@ class ApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["slides"][0]["index"], 0)
         self.assertEqual(response.json()["slides"][0]["placeholderRoles"], ["title", "subtitle"])
+        self.assertEqual(response.json()["cleanupMode"], "preserve_branding")
 
     def test_presentations_returns_binary_pptx(self) -> None:
         with patch("office_agent.api.app.render_presentation_artifact") as mock_render:
-            mock_render.return_value = Mock(filename="deck.pptx", content=b"pptx-bytes", warnings=[])
+            mock_render.return_value = Mock(
+                filename="deck.pptx",
+                content=b"pptx-bytes",
+                warnings=[],
+                finalize_summary=Mock(model_dump_json=Mock(return_value='{"enabled":false,"status":"skipped","rounds":[],"issuesFound":0,"operationsApplied":0,"warnings":[]}')),
+            )
             response = self.client.post("/api/presentations", json={"filename": "deck", "spec": SPEC.model_dump(mode="json")})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["content-type"], "application/vnd.openxmlformats-officedocument.presentationml.presentation")
         self.assertEqual(response.content, b"pptx-bytes")
         self.assertIn("filename*=UTF-8''deck.pptx", response.headers["content-disposition"])
+        self.assertIn("x-office-agent-finalize", response.headers)
 
     def test_presentations_rejects_invalid_spec(self) -> None:
         response = self.client.post(
@@ -113,10 +121,18 @@ class ApiTests(TestCase):
 
     def test_presentations_accepts_multipart_template_upload(self) -> None:
         with patch("office_agent.api.app.render_presentation_artifact") as mock_render:
-            mock_render.return_value = Mock(filename="deck.pptx", content=b"pptx-bytes", warnings=[])
+            mock_render.return_value = Mock(filename="deck.pptx", content=b"pptx-bytes", warnings=[], finalize_summary=None)
             response = self.client.post(
                 "/api/presentations",
-                data={"payload": json.dumps({"filename": "deck", "spec": SPEC.model_dump(mode="json")})},
+                data={
+                    "payload": json.dumps(
+                        {
+                            "filename": "deck",
+                            "spec": SPEC.model_dump(mode="json"),
+                            "finalize": {"enabled": True, "model": "gpt-4.1-mini", "apiKey": "secret", "maxRounds": 2},
+                        }
+                    )
+                },
                 files={
                     "template": (
                         "template.pptx",
@@ -128,3 +144,5 @@ class ApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_render.call_args.kwargs["template_bytes"], b"template-bytes")
         self.assertEqual(mock_render.call_args.kwargs["template_filename"], "template.pptx")
+        self.assertTrue(mock_render.call_args.kwargs["finalize_config"].enabled)
+        self.assertEqual(mock_render.call_args.kwargs["finalize_config"].model, "gpt-4.1-mini")

@@ -1,4 +1,5 @@
 import type {
+  FinalizeSummary,
   GenerateSpecRequest,
   PresentationSpec,
   RenderPresentationRequest,
@@ -45,6 +46,7 @@ export async function previewTemplate(templateFile: File): Promise<TemplatePrevi
 export interface RenderPresentationResult {
   blob: Blob;
   warnings: string[];
+  finalizeSummary?: FinalizeSummary | null;
 }
 
 export async function renderPresentation(
@@ -68,9 +70,11 @@ export async function renderPresentation(
     throw new Error(await readError(response));
   }
   const rawWarnings = response.headers.get("X-Office-Agent-Warnings");
+  const rawFinalize = response.headers.get("X-Office-Agent-Finalize");
   return {
     blob: await response.blob(),
     warnings: rawWarnings ? JSON.parse(decodeURIComponent(rawWarnings)) : [],
+    finalizeSummary: rawFinalize ? (JSON.parse(decodeURIComponent(rawFinalize)) as FinalizeSummary) : null,
   };
 }
 

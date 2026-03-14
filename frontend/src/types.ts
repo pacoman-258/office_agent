@@ -1,4 +1,5 @@
 export type Provider = "openai" | "ollama";
+export type FinalizeProvider = "openai";
 export type Language = "en" | "zh-CN";
 export type WorkflowStageStatus = "idle" | "running" | "success" | "error" | "skipped";
 export type WorkflowStageKey = "input" | "llm" | "render" | "office";
@@ -133,9 +134,19 @@ export interface GenerateSpecRequest {
   ollamaBaseUrl?: string;
 }
 
+export interface FinalizeConfig {
+  enabled: boolean;
+  provider?: FinalizeProvider;
+  model?: string;
+  apiKey?: string;
+  baseUrl?: string;
+  maxRounds?: number;
+}
+
 export interface RenderPresentationRequest {
   filename: string;
   spec: PresentationSpec;
+  finalize?: FinalizeConfig | null;
 }
 
 export interface TemplatePreviewSlide {
@@ -147,4 +158,24 @@ export interface TemplatePreviewSlide {
 
 export interface TemplatePreviewResponse {
   slides: TemplatePreviewSlide[];
+  cleanupMode?: "preserve_branding";
+}
+
+export interface FinalizeRoundResult {
+  roundIndex: number;
+  slidesReviewed: number;
+  issuesFound: number;
+  operationsApplied: number;
+  warnings: string[];
+}
+
+export interface FinalizeSummary {
+  enabled: boolean;
+  status: "skipped" | "completed" | "partial" | "failed";
+  provider?: FinalizeProvider | null;
+  model?: string | null;
+  rounds: FinalizeRoundResult[];
+  issuesFound: number;
+  operationsApplied: number;
+  warnings: string[];
 }

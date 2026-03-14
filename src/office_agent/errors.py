@@ -16,3 +16,7 @@ class SpecGenerationError(OfficeAgentError):
 
 class RenderError(OfficeAgentError):
     """Raised when rendering the PowerPoint fails."""
+
+
+class OfficeAutomationError(OfficeAgentError):
+    """Raised when PowerPoint automation or visual finalization fails."""

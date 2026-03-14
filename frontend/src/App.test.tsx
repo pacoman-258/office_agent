@@ -5,19 +5,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 const previewResponse = {
+  cleanupMode: "preserve_branding" as const,
   slides: [
-    {
-      index: 0,
-      thumbnailDataUrl: "data:image/png;base64,aaa",
-      titleText: "Cover",
-      placeholderRoles: ["title", "subtitle"],
-    },
-    {
-      index: 1,
-      thumbnailDataUrl: "data:image/png;base64,bbb",
-      titleText: "Content",
-      placeholderRoles: ["title", "body"],
-    },
+    { index: 0, thumbnailDataUrl: "data:image/png;base64,aaa", titleText: "Cover", placeholderRoles: ["title", "subtitle"] },
+    { index: 1, thumbnailDataUrl: "data:image/png;base64,bbb", titleText: "Content", placeholderRoles: ["title", "body"] },
   ],
 };
 
@@ -34,12 +25,7 @@ const specResponse = {
       cover_style: "minimal" as const,
     },
   },
-  template: {
-    opening: 0,
-    agenda: 1,
-    content: 1,
-    closing: 1,
-  },
+  template: { opening: 0, agenda: 1, content: 1, closing: 1 },
   slides: [
     { type: "title" as const, part: "opening" as const, title: "Intro", subtitle: "Subtitle" },
     {
@@ -68,6 +54,16 @@ function mockBinaryResponse(init?: ResponseInit): Response {
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
       "X-Office-Agent-Warnings": encodeURIComponent(JSON.stringify([])),
+      "X-Office-Agent-Finalize": encodeURIComponent(
+        JSON.stringify({
+          enabled: true,
+          status: "completed",
+          rounds: [{ roundIndex: 1, slidesReviewed: 1, issuesFound: 1, operationsApplied: 1, warnings: [] }],
+          issuesFound: 1,
+          operationsApplied: 1,
+          warnings: [],
+        }),
+      ),
     },
     ...init,
   });
@@ -98,64 +94,66 @@ describe("App", () => {
   it("toggles runtime fields when provider changes", async () => {
     render(<App />);
     expect(screen.getByLabelText("API Key")).toBeInTheDocument();
-
     await userEvent.selectOptions(screen.getByLabelText("Provider"), "ollama");
-
     expect(screen.queryByLabelText("API Key")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Ollama Base URL")).toBeInTheDocument();
   });
 
-  it("loads template previews and requires part mapping before generation", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(mockJsonResponse(previewResponse));
+  it("uses manual template mapping by default without requesting preview", async () => {
     render(<App />);
-
     const file = new File(["pptx-template"], "brand-template.pptx", {
       type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     });
     await userEvent.upload(screen.getByLabelText("Import PPTX Template"), file);
+    expect(screen.getByText("Manual Template Mapping")).toBeInTheDocument();
+    expect(screen.getByText("PowerPoint page numbers start at 1.")).toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalled();
+  });
 
+  it("can optionally load template previews", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(mockJsonResponse(previewResponse));
+    render(<App />);
+    const file = new File(["pptx-template"], "brand-template.pptx", {
+      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    });
+    await userEvent.upload(screen.getByLabelText("Import PPTX Template"), file);
+    await userEvent.click(screen.getByRole("button", { name: "Preview-assisted Mapping" }));
+    await userEvent.click(screen.getByRole("button", { name: "Load Template Preview" }));
     await screen.findByText("Cover");
-    expect(screen.getByText("Template Part Mapping")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Generate Spec" })).toBeDisabled();
+    expect(screen.getByText(/Template rendering preserves branding elements/i)).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("sends template mapping when generating a spec", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(mockJsonResponse(previewResponse))
-      .mockResolvedValueOnce(mockJsonResponse(specResponse));
+    vi.mocked(fetch).mockResolvedValueOnce(mockJsonResponse(specResponse));
     render(<App />);
-
     const file = new File(["pptx-template"], "brand-template.pptx", {
       type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     });
     await userEvent.upload(screen.getByLabelText("Import PPTX Template"), file);
-    await screen.findByText("Cover");
-
-    await userEvent.selectOptions(screen.getByLabelText("Opening"), "0");
-    await userEvent.selectOptions(screen.getByLabelText("Agenda"), "1");
-    await userEvent.selectOptions(screen.getByLabelText("Content"), "1");
-    await userEvent.selectOptions(screen.getByLabelText("Closing"), "1");
+    await userEvent.type(screen.getByLabelText("Opening"), "1");
+    await userEvent.type(screen.getByLabelText("Agenda"), "2");
+    await userEvent.type(screen.getByLabelText("Content"), "2");
+    await userEvent.type(screen.getByLabelText("Closing"), "2");
     await userEvent.type(screen.getByLabelText("Prompt"), "Create a team update deck");
     await userEvent.click(screen.getByRole("button", { name: "Generate Spec" }));
-
     await screen.findByText("Roadmap");
-    const specCall = vi.mocked(fetch).mock.calls[1];
+    const specCall = vi.mocked(fetch).mock.calls[0];
     const payload = JSON.parse((specCall[1] as RequestInit).body as string);
     expect(payload.templateMapping).toEqual({ opening: 0, agenda: 1, content: 1, closing: 1 });
   });
 
   it("supports language switching", async () => {
     render(<App />);
-
     await userEvent.click(screen.getByRole("button", { name: "中文" }));
-
-    expect(screen.getByText("主题、模板预览与版式映射")).toBeInTheDocument();
-    expect(screen.getByText("模板预览")).toBeInTheDocument();
+    expect(screen.getByText("主题、模板映射与可选预览")).toBeInTheDocument();
+    expect(
+      screen.getByText("默认模式不依赖模板预览。上传文件后可直接填写页码映射；如果你想看缩略图，再切换到预览模式。"),
+    ).toBeInTheDocument();
   });
 
   it("imports theme json with validation", async () => {
     render(<App />);
-
     fireEvent.change(screen.getByLabelText("Theme JSON"), {
       target: {
         value: JSON.stringify(
@@ -176,35 +174,29 @@ describe("App", () => {
       },
     });
     await userEvent.click(screen.getByRole("button", { name: "Import Theme JSON" }));
-
     expect(screen.getByText("executive / centered")).toBeInTheDocument();
   });
 
-  it("uploads a pptx template during render", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(mockJsonResponse(previewResponse))
-      .mockResolvedValueOnce(mockJsonResponse(specResponse))
-      .mockResolvedValueOnce(mockBinaryResponse());
+  it("uploads a pptx template during render and shows finalization summary", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(mockJsonResponse(specResponse)).mockResolvedValueOnce(mockBinaryResponse());
     render(<App />);
-
     const file = new File(["pptx-template"], "brand-template.pptx", {
       type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     });
     await userEvent.upload(screen.getByLabelText("Import PPTX Template"), file);
-    await screen.findByText("Cover");
-
-    await userEvent.selectOptions(screen.getByLabelText("Opening"), "0");
-    await userEvent.selectOptions(screen.getByLabelText("Agenda"), "1");
-    await userEvent.selectOptions(screen.getByLabelText("Content"), "1");
-    await userEvent.selectOptions(screen.getByLabelText("Closing"), "1");
+    await userEvent.type(screen.getByLabelText("Opening"), "1");
+    await userEvent.type(screen.getByLabelText("Agenda"), "2");
+    await userEvent.type(screen.getByLabelText("Content"), "2");
+    await userEvent.type(screen.getByLabelText("Closing"), "2");
     await userEvent.type(screen.getByLabelText("Prompt"), "Create a team update deck");
     await userEvent.click(screen.getByRole("button", { name: "Generate Spec" }));
     await screen.findByText("Roadmap");
+    await userEvent.selectOptions(screen.getByLabelText("Enable Visual Review"), "true");
     await userEvent.click(screen.getByRole("button", { name: "Confirm and Generate PPT" }));
-
-    expect(fetch).toHaveBeenCalledTimes(3);
-    const renderCall = vi.mocked(fetch).mock.calls[2];
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const renderCall = vi.mocked(fetch).mock.calls[1];
     const requestInit = renderCall[1] as RequestInit;
     expect(requestInit.body).toBeInstanceOf(FormData);
+    expect(screen.getByText("Visual Review Summary")).toBeInTheDocument();
   });
 });

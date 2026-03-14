@@ -4,6 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import requests
 from pptx import Presentation
@@ -31,7 +32,10 @@ from office_agent.schema import (
     TitleSlideSpec,
     TwoColumnSlideSpec,
 )
-from office_agent.template_support import duplicate_slide, extract_placeholder_roles, extract_shape_role
+from office_agent.template_support import TemplateSlot, analyze_template_slide, duplicate_slide, is_template_shell, sanitize_template_slide
+
+if TYPE_CHECKING:
+    from office_agent.office.models import FinalizeSummary
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,7 @@ PRESET_THEMES: dict[str, ThemeTokens] = {
 class RenderResult:
     path: Path
     warnings: list[str] = field(default_factory=list)
+    finalize_summary: "FinalizeSummary | None" = None
 
 
 class PresentationRenderer:
@@ -146,11 +151,18 @@ class PresentationRenderer:
             return False
 
         source_slide = template_source_slides[source_index]
-        available_roles = set(extract_placeholder_roles(source_slide))
+        source_analysis = analyze_template_slide(source_slide)
+        available_roles = set(source_analysis.placeholder_roles)
         required_roles = required_template_roles(slide_spec)
         if not required_roles.issubset(available_roles):
+            if is_template_shell(source_slide, source_analysis):
+                page = duplicate_slide(prs, source_slide)
+                page_analysis = analyze_template_slide(page)
+                sanitize_template_slide(page, page_analysis)
+                self._render_slide_on_page(page, slide_spec, tokens, warnings, temp_files, shell_mode=True)
+                return True
             warnings.append(
-                f"Template slide {source_index} for '{slide_spec.part}' is missing placeholders {sorted(required_roles - available_roles)}. Falling back to default rendering."
+                f"Template slide {source_index} for '{slide_spec.part}' does not expose writable roles {sorted(required_roles - available_roles)}. Falling back to default rendering."
             )
             return False
 
@@ -166,13 +178,14 @@ class PresentationRenderer:
             image_path = None
 
         page = duplicate_slide(prs, source_slide)
-        placeholder_map = self._map_template_shapes(page)
-        self._fill_text_placeholder(placeholder_map.get("title"), slide_spec.title)
-        self._fill_text_placeholder(placeholder_map.get("subtitle"), self._subtitle_text(slide_spec))
-        self._fill_body_placeholder(placeholder_map.get("body"), body_lines_for_slide(slide_spec))
-        self._fill_text_placeholder(placeholder_map.get("caption"), slide_spec.caption if isinstance(slide_spec, ImageSlideSpec) else None)
+        page_analysis = analyze_template_slide(page)
+        sanitize_template_slide(page, page_analysis)
+        self._fill_text_placeholder(page_analysis.slots.get("title"), slide_spec.title)
+        self._fill_text_placeholder(page_analysis.slots.get("subtitle"), self._subtitle_text(slide_spec))
+        self._fill_body_placeholder(page_analysis.slots.get("body"), body_lines_for_slide(slide_spec))
+        self._fill_text_placeholder(page_analysis.slots.get("caption"), slide_spec.caption if isinstance(slide_spec, ImageSlideSpec) else None)
         if isinstance(slide_spec, ImageSlideSpec) and image_path is not None:
-            self._fill_image_placeholder(page, placeholder_map.get("image"), image_path)
+            self._fill_image_placeholder(page, page_analysis.slots.get("image"), image_path)
         return True
 
     def _render_default_slide(
@@ -183,37 +196,80 @@ class PresentationRenderer:
         warnings: list[str],
         temp_files: list[Path],
     ) -> None:
+        page = self._new_slide(prs, tokens)
+        self._render_slide_on_page(page, slide_spec, tokens, warnings, temp_files)
+
+    def _render_slide_on_page(
+        self,
+        page,
+        slide_spec: SlideSpec,
+        tokens: ThemeTokens,
+        warnings: list[str],
+        temp_files: list[Path],
+        shell_mode: bool = False,
+    ) -> None:
         if isinstance(slide_spec, TitleSlideSpec):
-            self._render_title_slide(prs, slide_spec, tokens)
+            self._populate_title_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, SectionSlideSpec):
-            self._render_section_slide(prs, slide_spec, tokens)
+            self._populate_section_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, BulletsSlideSpec):
-            self._render_bullets_slide(prs, slide_spec, tokens)
+            self._populate_bullets_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, TwoColumnSlideSpec):
-            self._render_two_column_slide(prs, slide_spec, tokens)
+            self._populate_two_column_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, ImageSlideSpec):
-            temp_path, warning = self._render_image_slide(prs, slide_spec, tokens)
+            temp_path, warning = self._populate_image_slide(page, slide_spec, tokens)
             if temp_path is not None:
                 temp_files.append(temp_path)
             if warning:
                 warnings.append(warning)
         elif isinstance(slide_spec, TimelineSlideSpec):
-            self._render_timeline_slide(prs, slide_spec, tokens)
+            if shell_mode:
+                self._populate_linearized_body_slide(page, slide_spec.title, body_lines_for_slide(slide_spec), tokens)
+            else:
+                self._populate_timeline_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, QuoteSlideSpec):
-            self._render_quote_slide(prs, slide_spec, tokens)
+            if shell_mode:
+                self._populate_linearized_body_slide(page, slide_spec.title, body_lines_for_slide(slide_spec), tokens)
+            else:
+                self._populate_quote_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, ComparisonSlideSpec):
-            self._render_comparison_slide(prs, slide_spec, tokens)
+            if shell_mode:
+                self._populate_two_column_text_slide(
+                    page,
+                    slide_spec.title,
+                    slide_spec.left.title,
+                    slide_spec.left.bullets,
+                    slide_spec.right.title,
+                    slide_spec.right.bullets,
+                    tokens,
+                )
+            else:
+                self._populate_comparison_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, SummarySlideSpec):
-            self._render_summary_slide(prs, slide_spec, tokens)
+            if shell_mode:
+                self._populate_two_column_text_slide(
+                    page,
+                    slide_spec.title,
+                    "Key Points",
+                    slide_spec.key_points,
+                    "Next Steps",
+                    slide_spec.next_steps or ["No explicit next steps provided."],
+                    tokens,
+                )
+            else:
+                self._populate_summary_slide(page, slide_spec, tokens)
         elif isinstance(slide_spec, TableSlideSpec):
-            self._render_table_slide(prs, slide_spec, tokens)
+            self._populate_table_slide(page, slide_spec, tokens)
         else:
             raise RenderError(f"Unsupported slide spec: {slide_spec!r}")
 
     def _render_title_slide(self, prs: Presentation, slide: TitleSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_title_slide(page, slide, tokens)
+
+    def _populate_title_slide(self, page, slide: TitleSlideSpec, tokens: ThemeTokens) -> None:
         if tokens.cover_style == "band":
-            band = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(0), prs.slide_width, Inches(1.1))
+            band = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(0), self._slide_width(page), Inches(1.1))
             self._fill_shape(band, tokens.primary_color, tokens.primary_color)
 
         title_box = page.shapes.add_textbox(Inches(0.95), Inches(1.45), Inches(11.2), Inches(1.7))
@@ -240,6 +296,9 @@ class PresentationRenderer:
 
     def _render_section_slide(self, prs: Presentation, slide: SectionSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_section_slide(page, slide, tokens)
+
+    def _populate_section_slide(self, page, slide: SectionSlideSpec, tokens: ThemeTokens) -> None:
         badge = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.95), Inches(1.4), Inches(1.7), Inches(0.42))
         self._fill_shape(badge, tokens.accent_color, tokens.accent_color)
         badge.text = "Section"
@@ -263,35 +322,62 @@ class PresentationRenderer:
 
     def _render_bullets_slide(self, prs: Presentation, slide: BulletsSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_bullets_slide(page, slide, tokens)
+
+    def _populate_bullets_slide(self, page, slide: BulletsSlideSpec, tokens: ThemeTokens) -> None:
         self._add_slide_title(page, slide.title, tokens)
         textbox = page.shapes.add_textbox(Inches(0.9), Inches(1.65), Inches(11.2), Inches(4.9))
         self._write_bullets(textbox.text_frame, slide.bullets, tokens)
 
+    def _populate_linearized_body_slide(self, page, title: str, lines: list[str], tokens: ThemeTokens) -> None:
+        self._add_slide_title(page, title, tokens)
+        textbox = page.shapes.add_textbox(Inches(0.9), Inches(1.7), Inches(11.2), Inches(4.9))
+        self._write_bullets(textbox.text_frame, lines or ["No content provided."], tokens)
+
     def _render_two_column_slide(self, prs: Presentation, slide: TwoColumnSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
-        self._add_slide_title(page, slide.title, tokens)
+        self._populate_two_column_slide(page, slide, tokens)
+
+    def _populate_two_column_slide(self, page, slide: TwoColumnSlideSpec, tokens: ThemeTokens) -> None:
+        self._populate_two_column_text_slide(page, slide.title, slide.left_title, slide.left_bullets, slide.right_title, slide.right_bullets, tokens)
+
+    def _populate_two_column_text_slide(
+        self,
+        page,
+        title: str,
+        left_title: str | None,
+        left_bullets: list[str],
+        right_title: str | None,
+        right_bullets: list[str],
+        tokens: ThemeTokens,
+    ) -> None:
+        self._add_slide_title(page, title, tokens)
         left_box = page.shapes.add_textbox(Inches(0.9), Inches(1.8), Inches(5.2), Inches(4.8))
         right_box = page.shapes.add_textbox(Inches(7.0), Inches(1.8), Inches(5.2), Inches(4.8))
-        self._write_column(left_box.text_frame, slide.left_title, slide.left_bullets, tokens)
-        self._write_column(right_box.text_frame, slide.right_title, slide.right_bullets, tokens)
+        self._write_column(left_box.text_frame, left_title, left_bullets, tokens)
+        self._write_column(right_box.text_frame, right_title, right_bullets, tokens)
         divider = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(6.48), Inches(1.85), Inches(0.03), Inches(4.6))
         self._fill_shape(divider, tokens.accent_color, tokens.accent_color)
 
     def _render_image_slide(self, prs: Presentation, slide: ImageSlideSpec, tokens: ThemeTokens) -> tuple[Path | None, str | None]:
         page = self._new_slide(prs, tokens)
+        return self._populate_image_slide(page, slide, tokens)
+
+    def _populate_image_slide(self, page, slide: ImageSlideSpec, tokens: ThemeTokens) -> tuple[Path | None, str | None]:
         self._add_slide_title(page, slide.title, tokens)
         image_path, warning, cleanup = self._resolve_image_source(slide.image)
+        image_left, image_top, image_width, image_height = self._graphic_frame(page)
         if image_path:
-            self._add_image(page, image_path)
+            self._add_image(page, image_path, left=image_left, top=image_top, box_width=image_width, box_height=image_height)
             if slide.caption:
-                caption_box = page.shapes.add_textbox(Inches(0.9), Inches(6.25), Inches(8.0), Inches(0.45))
+                caption_box = page.shapes.add_textbox(image_left, image_top + image_height + Inches(0.12), image_width, Inches(0.42))
                 caption_p = caption_box.text_frame.paragraphs[0]
                 caption_p.text = slide.caption
                 caption_p.font.name = tokens.body_font
                 caption_p.font.size = Pt(11)
                 caption_p.font.color.rgb = rgb(tokens.muted_color)
         else:
-            placeholder_box = page.shapes.add_textbox(Inches(0.9), Inches(2.0), Inches(7.8), Inches(2.0))
+            placeholder_box = page.shapes.add_textbox(image_left, image_top + Inches(0.3), image_width, Inches(1.6))
             placeholder_p = placeholder_box.text_frame.paragraphs[0]
             placeholder_p.text = "Image unavailable. This slide was downgraded to a text summary."
             placeholder_p.font.name = tokens.body_font
@@ -300,46 +386,62 @@ class PresentationRenderer:
             placeholder_p.font.color.rgb = rgb(tokens.accent_color)
 
         notes = slide.bullets or ([slide.caption] if slide.caption else ["Add supporting notes here."])
-        bullet_box = page.shapes.add_textbox(Inches(9.2), Inches(1.8), Inches(3.1), Inches(4.6))
+        bullet_box = page.shapes.add_textbox(Inches(8.85), Inches(1.9), Inches(2.85), Inches(4.35))
         self._write_bullets(bullet_box.text_frame, notes, tokens)
         return cleanup, warning
 
     def _render_timeline_slide(self, prs: Presentation, slide: TimelineSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_timeline_slide(page, slide, tokens)
+
+    def _populate_timeline_slide(self, page, slide: TimelineSlideSpec, tokens: ThemeTokens) -> None:
         self._add_slide_title(page, slide.title, tokens)
-        line = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(1.0), Inches(3.6), Inches(11.0), Inches(0.05))
+        bounds_left = Inches(1.1)
+        bounds_width = Inches(10.7)
+        line_top = Inches(3.55)
+        line = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, bounds_left, line_top, bounds_width, Inches(0.05))
         self._fill_shape(line, tokens.accent_color, tokens.accent_color)
-        step_gap = 10.8 / max(1, len(slide.events) - 1)
+        step_gap = bounds_width / max(1, len(slide.events) - 1)
+        label_width = Inches(1.1)
+        title_width = Inches(1.45)
         for index, event in enumerate(slide.events):
-            x = 1.0 + index * step_gap
-            dot = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, Inches(x), Inches(3.4), Inches(0.22), Inches(0.22))
+            center_x = bounds_left + step_gap * index
+            dot = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, center_x - Inches(0.11), Inches(3.35), Inches(0.22), Inches(0.22))
             self._fill_shape(dot, tokens.accent_color, tokens.accent_color)
-            label_box = page.shapes.add_textbox(Inches(x - 0.25), Inches(2.75), Inches(1.0), Inches(0.4))
+            label_left = self._clamp_left(page, center_x - label_width / 2, label_width)
+            label_box = page.shapes.add_textbox(label_left, Inches(2.72), label_width, Inches(0.4))
             label_p = label_box.text_frame.paragraphs[0]
             label_p.text = event.label
             label_p.font.name = tokens.body_font
             label_p.font.size = Pt(11)
             label_p.font.bold = True
             label_p.font.color.rgb = rgb(tokens.accent_color)
+            label_p.alignment = PP_ALIGN.CENTER
 
-            title_box = page.shapes.add_textbox(Inches(x - 0.25), Inches(3.8), Inches(1.7), Inches(1.2))
+            title_left = self._clamp_left(page, center_x - title_width / 2, title_width)
+            title_box = page.shapes.add_textbox(title_left, Inches(3.78), title_width, Inches(1.05))
             frame = title_box.text_frame
             frame.word_wrap = True
             p = frame.paragraphs[0]
             p.text = event.title
             p.font.name = tokens.heading_font
-            p.font.size = Pt(14)
+            p.font.size = Pt(13)
             p.font.bold = True
             p.font.color.rgb = rgb(tokens.primary_color)
+            p.alignment = PP_ALIGN.CENTER
             if event.detail:
                 detail = frame.add_paragraph()
                 detail.text = event.detail
                 detail.font.name = tokens.body_font
-                detail.font.size = Pt(11)
+                detail.font.size = Pt(10)
                 detail.font.color.rgb = rgb(tokens.muted_color)
+                detail.alignment = PP_ALIGN.CENTER
 
     def _render_quote_slide(self, prs: Presentation, slide: QuoteSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_quote_slide(page, slide, tokens)
+
+    def _populate_quote_slide(self, page, slide: QuoteSlideSpec, tokens: ThemeTokens) -> None:
         quote_block = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.9), Inches(1.2), Inches(11.4), Inches(4.6))
         self._fill_shape(quote_block, lighten(tokens.background_color), tokens.accent_color)
         text_frame = quote_block.text_frame
@@ -367,36 +469,47 @@ class PresentationRenderer:
 
     def _render_comparison_slide(self, prs: Presentation, slide: ComparisonSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_comparison_slide(page, slide, tokens)
+
+    def _populate_comparison_slide(self, page, slide: ComparisonSlideSpec, tokens: ThemeTokens) -> None:
         self._add_slide_title(page, slide.title, tokens)
-        self._render_panel_with_bullets(page, Inches(0.9), slide.left.title, slide.left.bullets, tokens)
-        self._render_panel_with_bullets(page, Inches(6.7), slide.right.title, slide.right.bullets, tokens)
+        self._render_panel_with_bullets(page, Inches(1.05), slide.left.title, slide.left.bullets, tokens, width=Inches(5.25))
+        self._render_panel_with_bullets(page, Inches(7.03), slide.right.title, slide.right.bullets, tokens, width=Inches(5.25))
 
     def _render_summary_slide(self, prs: Presentation, slide: SummarySlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_summary_slide(page, slide, tokens)
+
+    def _populate_summary_slide(self, page, slide: SummarySlideSpec, tokens: ThemeTokens) -> None:
         self._add_slide_title(page, slide.title, tokens)
 
-        summary_panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.9), Inches(1.7), Inches(6.0), Inches(4.9))
+        summary_panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(1.05), Inches(1.8), Inches(5.45), Inches(4.55))
         self._fill_shape(summary_panel, lighten(tokens.background_color), tokens.accent_color)
         self._style_shape_text(summary_panel, tokens.heading_font, 16, tokens.primary_color, bold=True)
         summary_panel.text = "Key Points"
 
-        summary_text = page.shapes.add_textbox(Inches(1.2), Inches(2.25), Inches(5.3), Inches(3.8))
+        summary_text = page.shapes.add_textbox(Inches(1.32), Inches(2.3), Inches(4.95), Inches(3.45))
         self._write_bullets(summary_text.text_frame, slide.key_points, tokens)
 
-        next_steps_panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(7.3), Inches(1.7), Inches(5.0), Inches(4.9))
+        next_steps_panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(6.88), Inches(1.8), Inches(5.45), Inches(4.55))
         self._fill_shape(next_steps_panel, tokens.primary_color, tokens.primary_color)
         self._style_shape_text(next_steps_panel, tokens.heading_font, 16, "#FFFFFF", bold=True)
         next_steps_panel.text = "Next Steps"
 
-        next_steps_text = page.shapes.add_textbox(Inches(7.6), Inches(2.25), Inches(4.3), Inches(3.8))
+        next_steps_text = page.shapes.add_textbox(Inches(7.15), Inches(2.3), Inches(4.95), Inches(3.45))
         self._write_bullets(next_steps_text.text_frame, slide.next_steps or ["No explicit next steps provided."], tokens, font_color="#FFFFFF")
 
     def _render_table_slide(self, prs: Presentation, slide: TableSlideSpec, tokens: ThemeTokens) -> None:
         page = self._new_slide(prs, tokens)
+        self._populate_table_slide(page, slide, tokens)
+
+    def _populate_table_slide(self, page, slide: TableSlideSpec, tokens: ThemeTokens) -> None:
         self._add_slide_title(page, slide.title, tokens)
         rows = len(slide.rows) + 1
         cols = len(slide.headers)
-        table = page.shapes.add_table(rows, cols, Inches(0.9), Inches(1.7), Inches(11.5), Inches(4.9)).table
+        table_width = Inches(10.7)
+        table_left = self._center_horizontally(page, table_width)
+        table = page.shapes.add_table(rows, cols, table_left, Inches(1.82), table_width, Inches(4.35)).table
 
         for col_idx, header in enumerate(slide.headers):
             cell = table.cell(0, col_idx)
@@ -417,15 +530,14 @@ class PresentationRenderer:
         page.background.fill.fore_color.rgb = rgb(tokens.background_color)
         return page
 
-    def _map_template_shapes(self, slide) -> dict[str, object]:
-        return {role: shape for shape in slide.shapes if (role := extract_shape_role(shape))}
-
-    def _fill_text_placeholder(self, shape, value: str | None) -> None:
+    def _fill_text_placeholder(self, slot: TemplateSlot | None, value: str | None) -> None:
+        shape = slot.shape if slot is not None else None
         if shape is None or value is None or not getattr(shape, "has_text_frame", False):
             return
         shape.text = value
 
-    def _fill_body_placeholder(self, shape, lines: list[str]) -> None:
+    def _fill_body_placeholder(self, slot: TemplateSlot | None, lines: list[str]) -> None:
+        shape = slot.shape if slot is not None else None
         if shape is None or not lines or not getattr(shape, "has_text_frame", False):
             return
         frame = shape.text_frame
@@ -435,10 +547,10 @@ class PresentationRenderer:
             paragraph.text = line
             paragraph.level = 0
 
-    def _fill_image_placeholder(self, slide, shape, image_path: Path) -> None:
-        if shape is None:
+    def _fill_image_placeholder(self, slide, slot: TemplateSlot | None, image_path: Path) -> None:
+        if slot is None:
             return
-        slide.shapes.add_picture(str(image_path), shape.left, shape.top, width=shape.width, height=shape.height)
+        slide.shapes.add_picture(str(image_path), slot.left, slot.top, width=slot.width, height=slot.height)
 
     def _remove_template_source_slides(self, prs: Presentation, count: int) -> None:
         for index in range(count - 1, -1, -1):
@@ -447,12 +559,12 @@ class PresentationRenderer:
             prs.part.drop_rel(rel_id)
             prs.slides._sldIdLst.remove(slide_id)
 
-    def _render_panel_with_bullets(self, page, left: int, title: str, bullets: list[str], tokens: ThemeTokens) -> None:
-        panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, Inches(1.8), Inches(5.7), Inches(4.9))
+    def _render_panel_with_bullets(self, page, left: int, title: str, bullets: list[str], tokens: ThemeTokens, *, width) -> None:
+        panel = page.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, Inches(1.85), width, Inches(4.45))
         self._fill_shape(panel, lighten(tokens.background_color), tokens.accent_color)
         self._style_shape_text(panel, tokens.heading_font, 16, tokens.primary_color, bold=True)
         panel.text = title
-        body_box = page.shapes.add_textbox(left + Inches(0.28), Inches(2.35), Inches(5.1), Inches(3.9))
+        body_box = page.shapes.add_textbox(left + Inches(0.24), Inches(2.36), width - Inches(0.48), Inches(3.32))
         self._write_bullets(body_box.text_frame, bullets, tokens)
 
     def _add_slide_title(self, slide, title: str, tokens: ThemeTokens) -> None:
@@ -533,28 +645,49 @@ class PresentationRenderer:
             return path, None, None
         return None, f"Image path not found: {source}", None
 
-    def _add_image(self, slide, image_path: Path) -> None:
+    def _add_image(self, slide, image_path: Path, *, left, top, box_width, box_height) -> None:
         image = PptxImage.from_file(str(image_path))
         image_width_px, image_height_px = image.size
         aspect_ratio = image_width_px / image_height_px
-        box_left = Inches(0.9)
-        box_top = Inches(1.8)
-        box_width = Inches(7.8)
-        box_height = Inches(4.2)
         if (box_width / box_height) > aspect_ratio:
             height = box_height
             width = height * aspect_ratio
         else:
             width = box_width
             height = width / aspect_ratio
-        left = box_left + (box_width - width) / 2
-        top = box_top + (box_height - height) / 2
-        slide.shapes.add_picture(str(image_path), left, top, width=width, height=height)
+        picture_left = left + (box_width - width) / 2
+        picture_top = top + (box_height - height) / 2
+        slide.shapes.add_picture(str(image_path), picture_left, picture_top, width=width, height=height)
+
+    def _graphic_frame(self, page) -> tuple[int, int, int, int]:
+        width = Inches(7.15)
+        height = Inches(3.85)
+        return self._center_horizontally(page, width, offset=Inches(-1.7)), Inches(1.95), width, height
+
+    def _center_horizontally(self, page, width, *, offset=0):
+        return int((self._slide_width(page) - width) / 2 + offset)
+
+    def _clamp_left(self, page, preferred_left, width):
+        min_left = Inches(1.0)
+        max_left = self._slide_width(page) - width - Inches(1.0)
+        if preferred_left < min_left:
+            return int(min_left)
+        if preferred_left > max_left:
+            return int(max_left)
+        return int(preferred_left)
 
     def _subtitle_text(self, slide_spec: SlideSpec) -> str | None:
         if isinstance(slide_spec, (TitleSlideSpec, SectionSlideSpec)):
             return slide_spec.subtitle
         return None
+
+    def _slide_width(self, page) -> int:
+        sld_sz = page.part.package.presentation_part.presentation._element.find(
+            "{http://schemas.openxmlformats.org/presentationml/2006/main}sldSz"
+        )
+        if sld_sz is None:
+            raise RenderError("Unable to determine slide size for rendering.")
+        return int(sld_sz.get("cx"))
 
 
 def required_template_roles(slide_spec: SlideSpec) -> set[str]:

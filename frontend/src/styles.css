@@ -368,6 +368,12 @@ textarea {
   color: #f8f7f2;
 }
 
+.secondary-button.active-mode {
+  background: rgba(255, 198, 94, 0.16);
+  color: #fff3d2;
+  border: 1px solid rgba(255, 198, 94, 0.26);
+}
+
 .ghost-button {
   background: transparent;
   color: var(--text-muted);

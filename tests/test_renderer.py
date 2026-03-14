@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import requests
 from pptx import Presentation
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.util import Inches
 
 from office_agent.renderer import PresentationRenderer
@@ -59,6 +60,82 @@ class RendererTests(TestCase):
             self.assertTrue(result.path.exists())
             presentation = Presentation(str(result.path))
             self.assertEqual(len(presentation.slides), 6)
+
+    def test_timeline_shapes_stay_within_slide_bounds(self) -> None:
+        spec = PresentationSpec.model_validate(
+            {
+                "title": "Demo",
+                "slides": [
+                    {
+                        "type": "timeline",
+                        "part": "content",
+                        "title": "Roadmap",
+                        "events": [
+                            {"label": "Q1", "title": "Plan", "detail": "Scope"},
+                            {"label": "Q2", "title": "Build", "detail": "Execution"},
+                            {"label": "Q3", "title": "Pilot", "detail": "Feedback"},
+                            {"label": "Q4", "title": "Launch", "detail": "Scale"},
+                        ],
+                    }
+                ],
+            }
+        )
+        renderer = PresentationRenderer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_path = Path(temp_dir) / "timeline.pptx"
+            result = renderer.render(spec, out_path)
+            presentation = Presentation(str(result.path))
+            slide = presentation.slides[0]
+            slide_width = presentation.slide_width
+            for shape in slide.shapes:
+                self.assertGreaterEqual(int(shape.left), 0)
+                self.assertLessEqual(int(shape.left + shape.width), slide_width)
+
+    def test_graphic_slides_use_centered_safe_content_area(self) -> None:
+        spec = PresentationSpec.model_validate(
+            {
+                "title": "Demo",
+                "slides": [
+                    {
+                        "type": "image",
+                        "part": "content",
+                        "title": "Image",
+                        "image": "placeholder",
+                        "caption": "Local",
+                        "bullets": ["Point"],
+                    },
+                    {
+                        "type": "table",
+                        "part": "content",
+                        "title": "Budget",
+                        "headers": ["Item", "Owner", "Status"],
+                        "rows": [["Design", "Alice", "Done"], ["Build", "Bob", "Active"]],
+                    },
+                ],
+            }
+        )
+        renderer = PresentationRenderer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "pixel.png"
+            image_path.write_bytes(PNG_BYTES)
+            spec.slides[0].image = str(image_path)
+            out_path = Path(temp_dir) / "graphics.pptx"
+            result = renderer.render(spec, out_path)
+            presentation = Presentation(str(result.path))
+            slide_width = presentation.slide_width
+            margin = Inches(0.85)
+
+            image_slide = presentation.slides[0]
+            pictures = [shape for shape in image_slide.shapes if shape.shape_type.name in {"PICTURE", "LINKED_PICTURE"}]
+            self.assertEqual(len(pictures), 1)
+            picture = pictures[0]
+            self.assertGreaterEqual(int(picture.left), int(margin))
+            self.assertLessEqual(int(picture.left + picture.width), slide_width - int(margin))
+
+            table_slide = presentation.slides[1]
+            table_shape = next(shape for shape in table_slide.shapes if getattr(shape, "has_table", False))
+            self.assertGreaterEqual(int(table_shape.left), int(margin))
+            self.assertLessEqual(int(table_shape.left + table_shape.width), slide_width - int(margin))
 
     def test_renderer_downgrades_missing_image_url_to_text_slide(self) -> None:
         spec = PresentationSpec.model_validate(
@@ -139,6 +216,106 @@ class RendererTests(TestCase):
             self.assertIn("Generated", texts)
             self.assertIn("From template", texts)
 
+    def test_renderer_uses_native_powerpoint_placeholders_without_oa_markers(self) -> None:
+        spec = PresentationSpec.model_validate(
+            {
+                "title": "Demo",
+                "template": {"opening": 0, "agenda": 0, "content": 0, "closing": 0},
+                "slides": [{"type": "bullets", "part": "content", "title": "Generated title", "bullets": ["Point A", "Point B"]}],
+            }
+        )
+        renderer = PresentationRenderer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "native-template.pptx"
+            template = Presentation()
+            slide = template.slides.add_slide(template.slide_layouts[1])
+            slide.shapes.title.text = "Old title"
+            slide.placeholders[1].text = "Old body"
+            template.save(str(template_path))
+
+            out_path = Path(temp_dir) / "native-output.pptx"
+            result = renderer.render(spec, out_path, template_path=template_path)
+
+            self.assertFalse(result.warnings)
+            presentation = Presentation(str(result.path))
+            texts = [shape.text for shape in presentation.slides[0].shapes if getattr(shape, "has_text_frame", False)]
+            joined = "\n".join(texts)
+            self.assertIn("Generated title", joined)
+            self.assertIn("Point A", joined)
+            self.assertNotIn("Old body", joined)
+
+    def test_renderer_preserves_branding_assets_while_removing_template_content(self) -> None:
+        spec = PresentationSpec.model_validate(
+            {
+                "title": "Demo",
+                "template": {"opening": 0, "agenda": 0, "content": 0, "closing": 0},
+                "slides": [{"type": "bullets", "part": "content", "title": "Quarterly update", "bullets": ["Revenue up", "Hiring stable"]}],
+            }
+        )
+        renderer = PresentationRenderer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "brand-template.pptx"
+            logo_path = Path(temp_dir) / "logo.png"
+            hero_path = Path(temp_dir) / "hero.png"
+            logo_path.write_bytes(PNG_BYTES)
+            hero_path.write_bytes(PNG_BYTES)
+
+            template = Presentation()
+            slide = template.slides.add_slide(template.slide_layouts[6])
+            title_box = slide.shapes.add_textbox(Inches(0.8), Inches(0.6), Inches(6.5), Inches(0.8))
+            title_box.name = "oa:title"
+            title_box.text = "Old template title"
+            body_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(7.0), Inches(3.5))
+            body_box.name = "oa:body"
+            body_box.text = "Old template body"
+            slide.shapes.add_picture(str(logo_path), Inches(11.2), Inches(0.3), width=Inches(1.1), height=Inches(0.5))
+            slide.shapes.add_picture(str(hero_path), Inches(7.8), Inches(1.4), width=Inches(3.8), height=Inches(3.1))
+            note_box = slide.shapes.add_textbox(Inches(8.0), Inches(5.3), Inches(3.2), Inches(0.8))
+            note_box.text = "Template note to remove"
+            template.save(str(template_path))
+
+            out_path = Path(temp_dir) / "brand-output.pptx"
+            result = renderer.render(spec, out_path, template_path=template_path)
+
+            self.assertFalse(result.warnings)
+            presentation = Presentation(str(result.path))
+            rendered_slide = presentation.slides[0]
+            texts = [shape.text for shape in rendered_slide.shapes if getattr(shape, "has_text_frame", False)]
+            joined = "\n".join(texts)
+            self.assertIn("Quarterly update", joined)
+            self.assertIn("Revenue up", joined)
+            self.assertNotIn("Template note to remove", joined)
+            self.assertEqual(sum(1 for shape in rendered_slide.shapes if shape.shape_type.name in {"PICTURE", "LINKED_PICTURE"}), 1)
+
+    def test_renderer_uses_blank_template_shell_for_content_pages(self) -> None:
+        spec = PresentationSpec.model_validate(
+            {
+                "title": "Demo",
+                "template": {"opening": 0, "agenda": 1, "content": 2, "closing": 3},
+                "slides": [{"type": "bullets", "part": "content", "title": "Generated body", "bullets": ["Alpha", "Beta"]}],
+            }
+        )
+        renderer = PresentationRenderer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "shell-template.pptx"
+            template = Presentation()
+            template.slides.add_slide(template.slide_layouts[6])
+            template.slides.add_slide(template.slide_layouts[6])
+            shell_slide = template.slides.add_slide(template.slide_layouts[6])
+            shell_slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.4), Inches(0.4), Inches(1.2), Inches(0.12))
+            template.slides.add_slide(template.slide_layouts[6])
+            template.save(str(template_path))
+
+            out_path = Path(temp_dir) / "shell-output.pptx"
+            result = renderer.render(spec, out_path, template_path=template_path)
+
+            self.assertFalse(result.warnings)
+            presentation = Presentation(str(result.path))
+            rendered_slide = presentation.slides[0]
+            texts = [shape.text for shape in rendered_slide.shapes if getattr(shape, "has_text_frame", False)]
+            self.assertIn("Generated body", "\n".join(texts))
+            self.assertTrue(any(shape.shape_type.name == "AUTO_SHAPE" for shape in rendered_slide.shapes))
+
     def test_renderer_falls_back_when_template_placeholders_are_missing(self) -> None:
         spec = PresentationSpec.model_validate(
             {
@@ -160,5 +337,6 @@ class RendererTests(TestCase):
             result = renderer.render(spec, out_path, template_path=template_path)
 
             self.assertTrue(result.warnings)
+            self.assertIn("does not expose writable roles", result.warnings[0])
             presentation = Presentation(str(result.path))
             self.assertEqual(len(presentation.slides), 1)

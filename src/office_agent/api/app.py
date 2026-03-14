@@ -62,6 +62,7 @@ def create_app() -> FastAPI:
                 filename=render_request.filename,
                 template_bytes=template_bytes,
                 template_filename=template_upload.filename if template_upload is not None else None,
+                finalize_config=render_request.finalize.to_finalize_config() if render_request.finalize is not None else None,
             )
         finally:
             if template_upload is not None:
@@ -72,6 +73,10 @@ def create_app() -> FastAPI:
         }
         if artifact.warnings:
             headers["X-Office-Agent-Warnings"] = quote(json.dumps(artifact.warnings, ensure_ascii=False))
+        if artifact.finalize_summary is not None:
+            headers["X-Office-Agent-Finalize"] = quote(
+                str(artifact.finalize_summary.model_dump_json(by_alias=True, exclude_none=True))
+            )
         return Response(
             content=artifact.content,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
